@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# PyTorch
+*.pt
+*.pth
+
+# Data artifacts
+*.npy
+*.npz
+data/episodes/
+checkpoints/
+
+# Training logs
+runs/
+wandb/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Virtual environments
+venv/
+.venv/
