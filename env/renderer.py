@@ -1,117 +1,148 @@
 import numpy as np
 from env.voxel_world import BLOCK_COLORS, BlockType
 
+# Precompute a color lookup table: block_type_id -> (R, G, B)
+_COLOR_LUT = np.zeros((max(int(b) for b in BlockType) + 1, 3), dtype=np.float32)
+for bt, color in BLOCK_COLORS.items():
+    _COLOR_LUT[int(bt)] = color
+
 
 class Renderer:
-    def __init__(self, width=64, height=64, fov=np.pi / 3, max_dist=30.0):
+    def __init__(self, width=64, height=64, fov=np.pi / 3, max_dist=30.0, max_steps=128):
         self.width = width
         self.height = height
         self.fov = fov
         self.max_dist = max_dist
+        self.max_steps = max_steps
 
     def render(self, world):
-        image = np.zeros((self.height, self.width, 3), dtype=np.uint8)
-        sky_color = np.array(BLOCK_COLORS[BlockType.AIR], dtype=np.uint8)
-
         eye_x, eye_y, eye_z = world.get_agent_eye_pos()
         yaw = world.agent_yaw
 
-        for px in range(self.width):
-            for py in range(self.height):
-                # Ray direction
-                angle_h = yaw + self.fov * (0.5 - px / self.width)
-                angle_v = self.fov * (0.5 - py / self.height)
+        # --- Build all ray directions at once ---
+        px = np.arange(self.width, dtype=np.float64)
+        py = np.arange(self.height, dtype=np.float64)
+        px_grid, py_grid = np.meshgrid(px, py)
 
-                ray_dx = np.cos(angle_h) * np.cos(angle_v)
-                ray_dy = np.sin(angle_h) * np.cos(angle_v)
-                ray_dz = -np.sin(angle_v)
+        angle_h = yaw + self.fov * (0.5 - px_grid / self.width)
+        angle_v = self.fov * (0.5 - py_grid / self.height)
 
-                color, hit = self._cast_ray(world, eye_x, eye_y, eye_z, ray_dx, ray_dy, ray_dz)
+        ray_dx = np.cos(angle_h) * np.cos(angle_v)
+        ray_dy = np.sin(angle_h) * np.cos(angle_v)
+        ray_dz = -np.sin(angle_v)
 
-                if hit:
-                    image[py, px] = color
-                else:
-                    image[py, px] = sky_color
+        flat_dx = ray_dx.ravel()
+        flat_dy = ray_dy.ravel()
+        flat_dz = ray_dz.ravel()
+        N = len(flat_dx)
 
-        return image
+        # --- DDA setup for all rays in parallel ---
+        ox = np.full(N, eye_x)
+        oy = np.full(N, eye_y)
+        oz = np.full(N, eye_z)
 
-    def _cast_ray(self, world, ox, oy, oz, dx, dy, dz):
-        """3D DDA raycasting. Returns (color, hit)."""
-        # Current voxel
-        vx = int(np.floor(ox))
-        vy = int(np.floor(oy))
-        vz = int(np.floor(oz))
+        vx = np.floor(ox).astype(np.int32)
+        vy = np.floor(oy).astype(np.int32)
+        vz = np.floor(oz).astype(np.int32)
 
-        # Step direction
-        step_x = 1 if dx > 0 else -1
-        step_y = 1 if dy > 0 else -1
-        step_z = 1 if dz > 0 else -1
+        step_x = np.where(flat_dx > 0, 1, -1).astype(np.int32)
+        step_y = np.where(flat_dy > 0, 1, -1).astype(np.int32)
+        step_z = np.where(flat_dz > 0, 1, -1).astype(np.int32)
 
-        # t_delta: how much t to cross one voxel in each axis
-        t_delta_x = abs(1.0 / dx) if dx != 0 else 1e30
-        t_delta_y = abs(1.0 / dy) if dy != 0 else 1e30
-        t_delta_z = abs(1.0 / dz) if dz != 0 else 1e30
+        with np.errstate(divide="ignore"):
+            inv_dx = np.where(flat_dx != 0, 1.0 / flat_dx, 1e30)
+            inv_dy = np.where(flat_dy != 0, 1.0 / flat_dy, 1e30)
+            inv_dz = np.where(flat_dz != 0, 1.0 / flat_dz, 1e30)
 
-        # t_max: t at which the ray crosses the first boundary in each axis
-        if dx > 0:
-            t_max_x = (vx + 1 - ox) / dx
-        elif dx < 0:
-            t_max_x = (vx - ox) / dx
-        else:
-            t_max_x = 1e30
+        t_delta_x = np.abs(inv_dx)
+        t_delta_y = np.abs(inv_dy)
+        t_delta_z = np.abs(inv_dz)
 
-        if dy > 0:
-            t_max_y = (vy + 1 - oy) / dy
-        elif dy < 0:
-            t_max_y = (vy - oy) / dy
-        else:
-            t_max_y = 1e30
+        t_max_x = np.where(flat_dx > 0, (vx + 1 - ox) * inv_dx,
+                           np.where(flat_dx < 0, (vx - ox) * inv_dx, 1e30))
+        t_max_y = np.where(flat_dy > 0, (vy + 1 - oy) * inv_dy,
+                           np.where(flat_dy < 0, (vy - oy) * inv_dy, 1e30))
+        t_max_z = np.where(flat_dz > 0, (vz + 1 - oz) * inv_dz,
+                           np.where(flat_dz < 0, (vz - oz) * inv_dz, 1e30))
 
-        if dz > 0:
-            t_max_z = (vz + 1 - oz) / dz
-        elif dz < 0:
-            t_max_z = (vz - oz) / dz
-        else:
-            t_max_z = 1e30
+        # --- March all rays simultaneously ---
+        hit = np.zeros(N, dtype=bool)
+        hit_dist = np.full(N, self.max_dist)
+        hit_block = np.zeros(N, dtype=np.int32)
+        hit_face = np.zeros(N, dtype=np.int32)
 
-        dist = 0.0
+        active = np.ones(N, dtype=bool)
 
-        while dist < self.max_dist:
-            # Step along the axis with smallest t_max
-            if t_max_x < t_max_y and t_max_x < t_max_z:
-                dist = t_max_x
-                t_max_x += t_delta_x
-                vx += step_x
-                face = 0  # hit an x-face
-            elif t_max_y < t_max_z:
-                dist = t_max_y
-                t_max_y += t_delta_y
-                vy += step_y
-                face = 1  # hit a y-face
-            else:
-                dist = t_max_z
-                t_max_z += t_delta_z
-                vz += step_z
-                face = 2  # hit a z-face
+        for _ in range(self.max_steps):
+            if not np.any(active):
+                break
 
-            # Check bounds
-            if vx < 0 or vx >= world.width or vy < 0 or vy >= world.depth or vz < 0 or vz >= world.height:
-                return None, False
+            # Determine which axis each active ray steps along
+            step_x_mask = active & (t_max_x < t_max_y) & (t_max_x < t_max_z)
+            step_y_mask = active & ~step_x_mask & (t_max_y < t_max_z)
+            step_z_mask = active & ~step_x_mask & ~step_y_mask
 
-            block = world.get_block(vx, vy, vz)
-            if block != BlockType.AIR:
-                base_color = np.array(BLOCK_COLORS[block], dtype=np.float32)
+            # Record distances before stepping
+            dist = np.where(step_x_mask, t_max_x,
+                            np.where(step_y_mask, t_max_y, t_max_z))
 
-                # Distance fog
-                shade = 1.0 / (1.0 + 0.08 * dist * dist)
+            # Deactivate rays that exceeded max distance
+            too_far = active & (dist >= self.max_dist)
+            active[too_far] = False
 
-                # Darken side faces slightly for depth cues
-                if face == 0:
-                    shade *= 0.8
-                elif face == 1:
-                    shade *= 0.9
+            # Step voxel coordinates
+            vx[step_x_mask] += step_x[step_x_mask]
+            vy[step_y_mask] += step_y[step_y_mask]
+            vz[step_z_mask] += step_z[step_z_mask]
 
-                color = np.clip(base_color * shade, 0, 255).astype(np.uint8)
-                return color, True
+            # Advance t_max
+            t_max_x[step_x_mask] += t_delta_x[step_x_mask]
+            t_max_y[step_y_mask] += t_delta_y[step_y_mask]
+            t_max_z[step_z_mask] += t_delta_z[step_z_mask]
 
-        return None, False
+            # Deactivate rays that left the grid
+            out_of_bounds = active & (
+                (vx < 0) | (vx >= world.width) |
+                (vy < 0) | (vy >= world.depth) |
+                (vz < 0) | (vz >= world.height)
+            )
+            active[out_of_bounds] = False
+
+            # Look up block types for active, in-bounds rays
+            check = active & ~out_of_bounds
+            if not np.any(check):
+                continue
+
+            check_idx = np.where(check)[0]
+            blocks = world.grid[vx[check_idx], vy[check_idx], vz[check_idx]]
+
+            solid = blocks != int(BlockType.AIR)
+            solid_idx = check_idx[solid]
+
+            if len(solid_idx) > 0:
+                hit[solid_idx] = True
+                hit_dist[solid_idx] = dist[solid_idx]
+                hit_block[solid_idx] = blocks[solid]
+                hit_face[solid_idx] = np.where(
+                    step_x_mask[solid_idx], 0,
+                    np.where(step_y_mask[solid_idx], 1, 2)
+                )
+                active[solid_idx] = False
+
+        # --- Shade and assemble the final image ---
+        sky = np.array(BLOCK_COLORS[BlockType.AIR], dtype=np.float32)
+        image = np.tile(sky, (N, 1))
+
+        if np.any(hit):
+            hit_idx = np.where(hit)[0]
+            base_colors = _COLOR_LUT[hit_block[hit_idx]]
+
+            shade = 1.0 / (1.0 + 0.08 * hit_dist[hit_idx] ** 2)
+            face_mul = np.where(hit_face[hit_idx] == 0, 0.8,
+                                np.where(hit_face[hit_idx] == 1, 0.9, 1.0))
+            shade *= face_mul
+
+            image[hit_idx] = base_colors * shade[:, np.newaxis]
+
+        image = np.clip(image, 0, 255).astype(np.uint8)
+        return image.reshape(self.height, self.width, 3)
